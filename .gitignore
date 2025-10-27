@@ -1,0 +1,22 @@
+# Environment configuration
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Data and generated outputs
+outputs/
+data/
+
+# OS/editor junk
+*.tmp
+Thumbs.db
+.DS_Store
+.ipynb_checkpoints/

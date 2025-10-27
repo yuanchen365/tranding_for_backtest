@@ -8,6 +8,7 @@ Two sources are supported:
 2) Shioaji API (optional dependency) with automatic batching to daily bars.
 """
 
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -55,7 +56,10 @@ class CsvDataSource:
         if missing:
             raise DataLoaderError(f"{path} missing columns: {missing}")
         df = df[["Open", "High", "Low", "Close", *(["Volume"] if "Volume" in df.columns else [])]]
-        df.index = df.index.tz_localize(TAIWAN_TZ, nonexistent="shift_forward", ambiguous="NaT").tz_convert(None)
+        localized_index = df.index.tz_localize(
+            TAIWAN_TZ, nonexistent="shift_forward", ambiguous="NaT"
+        )
+        df.index = localized_index.tz_localize(None)
         mask = (df.index.date >= start.date()) & (True if end is None else df.index.date <= end.date())
         df = df.loc[mask]
         return df
@@ -82,12 +86,55 @@ class ShioajiDataSource:
         self.api.login(api_key=api_key, secret_key=secret_key)
         self.symbol_map = symbol_map or {}
 
+    def _contract_from_path(self, path: str):
+        parts = [segment for segment in re.split(r"[/.]", path) if segment]
+        if not parts:
+            raise DataLoaderError(f"Invalid Shioaji contract path: {path}")
+        node = self.api.Contracts
+        for segment in parts:
+            attr_value = None
+            if hasattr(node, segment):
+                attr_value = getattr(node, segment)
+            if attr_value not in (None, node):
+                node = attr_value
+                continue
+            try:
+                node = node[segment]
+            except Exception as exc:
+                raise DataLoaderError(
+                    f"Unable to traverse Shioaji contract path '{path}' at segment '{segment}'"
+                ) from exc
+        return node
+
     def _resolve_contract(self, symbol: str):
         key = self.symbol_map.get(symbol, symbol)
-        try:
-            return self.api.Contracts.Stocks[key]
-        except KeyError as exc:  # pragma: no cover - depends on API data
-            raise DataLoaderError(f"Unknown Shioaji contract key for symbol {symbol}: {key}") from exc
+        if not key:
+            raise DataLoaderError(f"Symbol mapping for {symbol} is empty.")
+
+        # 1) allow direct contract path syntax (e.g. Futures/TXF/TXFR1)
+        if isinstance(key, str) and ("/" in key or "." in key):
+            return self._contract_from_path(key)
+
+        # 2) default to stock dictionary lookup
+        stocks = getattr(self.api.Contracts, "Stocks", None)
+        if stocks is not None and isinstance(key, str):
+            try:
+                return stocks[key]
+            except KeyError:
+                pass
+
+        # 3) heuristic for futures/options symbols (e.g. TXFR1 -> Futures/TXF/TXFR1)
+        if isinstance(key, str) and key.isupper() and len(key) >= 4:
+            guessed_product = key[:3]
+            try:
+                return self._contract_from_path(f"Futures/{guessed_product}/{key}")
+            except DataLoaderError:
+                pass
+
+        raise DataLoaderError(
+            "Unknown Shioaji contract key for "
+            f"symbol {symbol}: {key}. 請參考 Shioaji 合約文件，使用如 Futures/TXF/TXFR1 的完整路徑。"
+        )
 
     def fetch(self, symbol: str, start: datetime, end: Optional[datetime]) -> pd.DataFrame:
         contract = self._resolve_contract(symbol)
@@ -132,7 +179,7 @@ class ShioajiDataSource:
                 "Volume": "sum",
             }
         ).dropna()
-        daily.index = daily.index.tz_convert(None)
+        daily.index = daily.index.tz_localize(None)
         mask = (daily.index.date >= start.date()) & (True if end is None else daily.index.date <= end.date())
         return daily.loc[mask]
 
